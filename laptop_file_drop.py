@@ -1,282 +1,343 @@
 """
-Laptop File Drop
-================
-Move files between this laptop and an iPad / iPhone (or any device with a web
-browser) over your home Wi-Fi, in both directions. It is the laptop version
-of TV File Drop.
+Laptop File Drop  (version 2)
+=============================
+Move files and text between this laptop and an iPad / iPhone (or any device
+with a web browser) over your home Wi-Fi, in both directions.
 
 How to run:   double-click this file   (or:  python laptop_file_drop.py)
 Needs:        Python 3.8 or newer. Nothing else to install.
 Optional:     "pip install qrcode" to also show a QR code in the window.
 
-How it works (same idea as the TV app):
+How it works:
   1. This program starts a small web server on port 8080.
   2. The window shows an address such as http://192.168.1.50:8080
-  3. You open that address in Safari, pick files and tap Upload.
-  4. Each file is copied network -> 64 KB buffer -> disk, so even very large
-     videos use almost no memory.
+  3. You open that address in Safari. The web page can
+       - send files to the laptop        (upload)
+       - get files from the laptop       (download, or view photos/videos)
+       - exchange a piece of text        (links, notes, codes)
+  4. Files are always copied in 64 KB pieces, so even very large videos
+     use almost no memory.
+
+Reading order if you want to learn from the code:
+  State -> helpers -> Handler (the web server) -> ServerControl -> run_window
 """
 
 import json
+import mimetypes
 import os
 import queue
 import re
 import secrets
+import shutil
 import socket
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
 
+APP_NAME = "Laptop File Drop"
 FIRST_PORT = 8080
 BUFFER_SIZE = 64 * 1024
+MAX_TEXT_BYTES = 200_000                     # longest text that can be exchanged
 SETTINGS_FILE = Path.home() / ".laptop_file_drop.json"
 DEFAULT_FOLDER = Path.home() / "Downloads" / "FileDrop"
 
-# The web page the iPad sees. It is the same page as in the TV app.
+# The web page the phone or tablet sees: HTML + CSS + JavaScript in one piece.
+# No libraries and no internet are needed.
 PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="File Drop">
+<meta name="theme-color" content="#101826">
+<link rel="icon" href="data:,">
 <title>Laptop File Drop</title>
-<!-- This single file is the whole iPad interface. No libraries, no internet:
-     the styles and the script are all inside this file. -->
 <style>
   * { box-sizing: border-box; }
   body {
-    margin: 0 auto; padding: 24px; max-width: 760px;
-    font-family: -apple-system, Helvetica, Arial, sans-serif;
-    font-size: 20px; color: #fff; background: #101826;
+    margin: 0 auto; padding: 20px 20px 60px; max-width: 760px;
+    font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: 18px; color: #fff; background: #101826;
   }
-  h1 { font-size: 30px; margin: 8px 0 24px; }
+  h1 { font-size: 28px; margin: 8px 0 2px; }
+  #device { color: #9fb0c8; margin: 0 0 20px; }
+  h2 { font-size: 22px; margin: 34px 0 14px; padding-top: 22px; border-top: 2px solid #2d3b55; }
+  .hint { color: #9fb0c8; font-size: 16px; }
 
-  /* Big buttons: at least 64px tall so they are easy to tap. */
+  /* Big buttons: at least 60px tall so they are easy to tap. */
   .btn {
-    display: block; width: 100%; min-height: 64px; margin: 0 0 16px;
-    padding: 18px; border: 0; border-radius: 14px;
-    font-size: 24px; font-weight: 600; text-align: center;
-    color: #fff; background: #2d3b55; cursor: pointer;
-    -webkit-appearance: none;
+    display: block; width: 100%; min-height: 60px; margin: 0 0 14px;
+    padding: 16px; border: 0; border-radius: 14px;
+    font-size: 22px; font-weight: 600; text-align: center; text-decoration: none;
+    color: #fff; background: #1e88e5; cursor: pointer; -webkit-appearance: none;
   }
-  .btn.primary { background: #1e88e5; }
-  .btn:disabled { opacity: .4; }
+  .btn.quiet { background: #2d3b55; }
+  .small {
+    min-height: 44px; padding: 8px 16px; border: 0; border-radius: 10px;
+    font-size: 17px; font-weight: 600; text-decoration: none; display: inline-block;
+    color: #fff; background: #2d3b55; cursor: pointer; -webkit-appearance: none;
+  }
+  .small.go { background: #1e88e5; }
 
   /* The real file input is hidden; the "Choose files" label opens it. */
   #picker { position: absolute; left: -9999px; width: 1px; height: 1px; opacity: 0; }
+  #drop.over { outline: 3px dashed #ffd54f; outline-offset: 6px; }
 
-  #pinBox { margin: 0 0 16px; }
+  #pinBox { margin: 0 0 18px; }
   #pinBox label { display: block; margin-bottom: 8px; color: #9fb0c8; }
   #pin {
-    width: 100%; height: 64px; padding: 0 18px; border: 2px solid #2d3b55;
-    border-radius: 14px; font-size: 30px; letter-spacing: 10px; text-align: center;
-    color: #fff; background: #0b111c;
+    width: 100%; height: 60px; border: 2px solid #2d3b55; border-radius: 14px;
+    font-size: 28px; letter-spacing: 10px; text-align: center; color: #fff; background: #0b111c;
   }
+  textarea {
+    width: 100%; min-height: 110px; margin: 0 0 12px; padding: 12px;
+    border: 2px solid #2d3b55; border-radius: 14px;
+    font: inherit; color: #fff; background: #0b111c;
+  }
+  #message, #textMessage { min-height: 26px; margin: 2px 0 14px; color: #ffd54f; }
 
-  #message { min-height: 28px; margin: 4px 0 16px; color: #ffd54f; }
-
-  .file { margin: 0 0 14px; padding: 14px 16px; border-radius: 14px; background: #1a2436; }
+  .card { margin: 0 0 12px; padding: 14px 16px; border-radius: 14px; background: #1a2436; }
+  .top { display: flex; align-items: center; gap: 12px; }
+  .grow { flex: 1; min-width: 0; }
   .name { word-break: break-all; }
-  .size { color: #9fb0c8; font-size: 16px; }
-  .track { height: 14px; margin: 10px 0 8px; border-radius: 7px; background: #0b111c; overflow: hidden; }
+  .size { color: #9fb0c8; font-size: 15px; }
+  .track { height: 12px; margin: 10px 0 8px; border-radius: 6px; background: #0b111c; overflow: hidden; }
   .bar { height: 100%; width: 0; background: #1e88e5; }
-  .state { font-size: 18px; color: #9fb0c8; }
+  .state { font-size: 16px; color: #9fb0c8; }
   .state.ok { color: #66d98a; }
   .state.bad { color: #ff8a80; }
-  h2 { font-size: 24px; margin: 36px 0 16px; padding-top: 24px; border-top: 2px solid #2d3b55; }
-  a.btn { text-decoration: none; word-break: break-all; font-size: 20px; }
-  #shared { color: #9fb0c8; }
+  .actions { margin-top: 10px; display: flex; gap: 10px; flex-wrap: wrap; }
 </style>
 </head>
 <body>
 
-<h1>Send files to the laptop</h1>
+<h1>Laptop File Drop</h1>
+<p id="device">Connecting…</p>
 
 <div id="pinBox" style="display:none">
   <label for="pin">PIN shown on the laptop</label>
   <input id="pin" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="4" autocomplete="off">
 </div>
 
-<label class="btn" for="picker">Choose files</label>
-<input id="picker" type="file" multiple>
-
-<button id="uploadBtn" class="btn primary" disabled>Upload</button>
-
+<!-- 1. This device -> laptop -->
+<div id="drop">
+  <label class="btn" for="picker">Send files to the laptop</label>
+  <input id="picker" type="file" multiple>
+</div>
 <div id="message"></div>
 <div id="list"></div>
 
+<!-- 2. Laptop -> this device -->
 <h2>Get files from the laptop</h2>
-<div id="shared"></div>
+<div id="shared" class="hint"></div>
+
+<!-- 3. Text in both directions -->
+<h2>Text</h2>
+<div id="fromLaptop" style="display:none">
+  <p class="hint">From the laptop:</p>
+  <textarea id="textIn" readonly></textarea>
+  <button id="copyBtn" class="btn quiet">Copy</button>
+</div>
+<textarea id="textOut" placeholder="Type or paste a link, a note, a code…"></textarea>
+<button id="textBtn" class="btn quiet">Send text to the laptop</button>
+<div id="textMessage"></div>
 
 <script>
 (function () {
-  // Shortcuts to the elements on the page.
-  var picker = document.getElementById('picker');
-  var uploadBtn = document.getElementById('uploadBtn');
-  var pinBox = document.getElementById('pinBox');
-  var pinInput = document.getElementById('pin');
-  var message = document.getElementById('message');
-  var list = document.getElementById('list');
+  function $(id) { return document.getElementById(id); }
+  var picker = $('picker'), pinInput = $('pin'), message = $('message'), list = $('list');
 
-  var items = [];          // one entry per chosen file
-  var busy = false;        // true while uploads are running
+  var items = [];           // every file chosen so far, in order
+  var active = null;        // the file being uploaded right now (one at a time)
   var pinRequired = false;
+  var okPin = null;         // a PIN the laptop accepted
+  var deniedPin = null;     // a PIN the laptop refused: do not try it again
 
-  // ---- 1. Ask the laptop whether a PIN is needed ----
-  request('GET', '/api/info', function (status, data) {
-    if (status === 200 && data && data.pin) {
-      pinRequired = true;
-      pinBox.style.display = 'block';
-    }
-  });
-
-  // ---- 2. The user picked files: show them in a list ----
-  picker.addEventListener('change', function () {
-    if (busy) { return; }
-    items = [];
-    list.innerHTML = '';
-    message.textContent = '';
-    for (var i = 0; i < picker.files.length; i++) {
-      items.push(makeRow(picker.files[i]));
-    }
-    uploadBtn.disabled = items.length === 0;
-  });
-
-  // Builds the box for one file: name, size, progress bar, state text.
-  function makeRow(file) {
-    var box = document.createElement('div');
-    box.className = 'file';
-
-    var name = document.createElement('div');
-    name.className = 'name';
-    name.textContent = file.name;
-
-    var size = document.createElement('div');
-    size.className = 'size';
-    size.textContent = readableSize(file.size);
-
-    var track = document.createElement('div');
-    track.className = 'track';
-    var bar = document.createElement('div');
-    bar.className = 'bar';
-    track.appendChild(bar);
-
-    var state = document.createElement('div');
-    state.className = 'state';
-    state.textContent = 'Waiting';
-
-    box.appendChild(name);
-    box.appendChild(size);
-    box.appendChild(track);
-    box.appendChild(state);
-    list.appendChild(box);
-
-    return { file: file, bar: bar, state: state, done: false };
-  }
-
-  // ---- 3. "Upload" was tapped ----
-  uploadBtn.addEventListener('click', function () {
-    if (busy || items.length === 0) { return; }
-    if (pinRequired && pinInput.value.length !== 4) {
-      message.textContent = 'Type the 4-digit PIN shown on the laptop.';
-      pinInput.focus();
+  // ---------------------------------------------------------------
+  // Start: ask the laptop for its name and whether a PIN is needed
+  // ---------------------------------------------------------------
+  request('GET', '/api/info', null, function (status, data) {
+    if (status !== 200 || !data) {
+      $('device').textContent = 'Cannot reach the laptop. Is the app running?';
       return;
     }
-    setBusy(true);
-    message.textContent = 'Checking…';
+    $('device').textContent = 'Connected to ' + data.name;
+    pinRequired = !!data.pin;
+    $('pinBox').style.display = pinRequired ? 'block' : 'none';
+    loadShared();
+  });
 
-    // Check the PIN first, so a wrong PIN is reported before any file is sent.
-    request('GET', '/api/check', function (status, data) {
-      if (status === 200) {
-        message.textContent = 'Uploading… keep this page open.';
-        uploadNext(0);
-      } else {
-        setBusy(false);
-        message.textContent = (data && data.error) ? data.error
-          : 'Cannot reach the laptop. Is the server running?';
+  pinInput.addEventListener('input', function () { loadShared(); pump(); });
+
+  // ---------------------------------------------------------------
+  // 1. Sending files to the laptop
+  // ---------------------------------------------------------------
+  picker.addEventListener('change', function () {
+    addFiles(picker.files);
+    picker.value = '';                    // so the same file can be chosen again later
+  });
+
+  // On a computer you can also drag files onto the page.
+  document.addEventListener('dragover', function (e) { e.preventDefault(); $('drop').className = 'over'; });
+  document.addEventListener('dragleave', function () { $('drop').className = ''; });
+  document.addEventListener('drop', function (e) {
+    e.preventDefault();
+    $('drop').className = '';
+    if (e.dataTransfer && e.dataTransfer.files) { addFiles(e.dataTransfer.files); }
+  });
+
+  function addFiles(files) {
+    for (var i = 0; i < files.length; i++) { items.push(makeRow(files[i])); }
+    pump();
+  }
+
+  // Builds the card for one file: name, size, progress bar, state, one button.
+  function makeRow(file) {
+    var card = el('div', 'card'), top = el('div', 'top'), grow = el('div', 'grow');
+    var name = el('div', 'name', file.name), size = el('div', 'size', readableSize(file.size));
+    var button = el('button', 'small', 'Cancel');
+    var track = el('div', 'track'), bar = el('div', 'bar'), state = el('div', 'state', 'Waiting');
+    grow.appendChild(name); grow.appendChild(size);
+    top.appendChild(grow); top.appendChild(button);
+    track.appendChild(bar);
+    card.appendChild(top); card.appendChild(track); card.appendChild(state);
+    list.appendChild(card);
+
+    var item = { file: file, bar: bar, state: state, button: button, status: 'waiting', xhr: null };
+    button.addEventListener('click', function () {
+      if (item.status === 'uploading' && item.xhr) {
+        item.xhr.abort();                           // Cancel
+      } else if (item.status === 'waiting') {
+        finish(item, 'cancelled', 'Cancelled');
+      } else if (item.status === 'failed' || item.status === 'cancelled') {
+        item.status = 'waiting';                    // Retry
+        item.state.className = 'state';
+        item.state.textContent = 'Waiting';
+        item.button.textContent = 'Cancel';
+        pump();
       }
     });
-  });
-
-  // Uploads files one after another (one at a time is kindest to the laptop).
-  function uploadNext(index) {
-    while (index < items.length && items[index].done) { index++; }
-    if (index >= items.length) {
-      setBusy(false);
-      var failed = 0;
-      for (var i = 0; i < items.length; i++) { if (!items[i].done) { failed++; } }
-      message.textContent = failed === 0 ? 'All done ✓'
-        : failed + ' file(s) failed. Tap Upload to try those again.';
-      return;
-    }
-    uploadOne(items[index], function () { uploadNext(index + 1); });
+    return item;
   }
 
-  // Sends ONE file. The request body is the file itself, so Safari reads it
-  // from storage piece by piece and never loads the whole file into memory.
-  function uploadOne(item, next) {
+  // Starts the next waiting file, if nothing is being uploaded.
+  function pump() {
+    if (active) { return; }
+    var next = null;
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].status === 'waiting') { next = items[i]; break; }
+    }
+    if (!next) { summary(); return; }
+
+    var pin = pinInput.value;
+    if (pinRequired && pin !== okPin) {
+      if (pin.length !== 4) { message.textContent = 'Type the 4-digit PIN shown on the laptop.'; pinInput.focus(); return; }
+      if (pin === deniedPin) { return; }
+      // Check the PIN before any file is sent, so a wrong PIN is reported at once.
+      active = next;
+      request('GET', '/api/check', null, function (status, data) {
+        active = null;
+        if (status === 200) { okPin = pin; pump(); }
+        else {
+          deniedPin = pin;
+          message.textContent = (data && data.error) ? data.error : 'Cannot reach the laptop.';
+        }
+      });
+      return;
+    }
+    uploadOne(next);
+  }
+
+  // Sends ONE file. The request body is the file itself, so the browser reads
+  // it from storage piece by piece and never loads it all into memory.
+  function uploadOne(item) {
+    active = item;
+    item.status = 'uploading';
+    item.button.textContent = 'Cancel';
+    item.button.style.display = '';
+    item.state.className = 'state';
+    item.state.textContent = 'Starting…';
+    item.bar.style.width = '0';
+    message.textContent = 'Uploading… keep this page open.';
+
     var xhr = new XMLHttpRequest();
+    item.xhr = xhr;
     xhr.open('POST', '/api/upload?name=' + encodeURIComponent(item.file.name));
     xhr.setRequestHeader('Content-Type', 'application/octet-stream');
     xhr.setRequestHeader('X-Pin', pinInput.value);
 
-    item.state.className = 'state';
-    item.state.textContent = 'Uploading… 0%';
-    item.bar.style.width = '0';
-
-    // Called many times while the file is being sent.
+    var started = Date.now();
     xhr.upload.onprogress = function (e) {
       if (!e.lengthComputable || e.total === 0) { return; }
       var percent = Math.floor(e.loaded * 100 / e.total);
+      var seconds = (Date.now() - started) / 1000;
+      var text = percent + '%';
+      if (seconds > 1) {
+        var speed = e.loaded / seconds;                       // bytes per second
+        var left = (e.total - e.loaded) / speed;              // seconds left
+        text += '  ·  ' + readableSize(speed) + '/s  ·  ' + readableTime(left) + ' left';
+      }
       item.bar.style.width = percent + '%';
-      item.state.textContent = 'Uploading… ' + percent + '%';
+      item.state.textContent = text;
     };
-
-    // The TV answered.
     xhr.onload = function () {
       var data = parse(xhr.responseText);
       if (xhr.status === 200 && data && data.ok) {
-        item.done = true;
         item.bar.style.width = '100%';
-        item.state.className = 'state ok';
-        item.state.textContent = (data.name && data.name !== item.file.name)
-          ? 'Done ✓  (saved as ' + data.name + ')' : 'Done ✓';
+        finish(item, 'done', (data.name && data.name !== item.file.name)
+          ? 'Done ✓  (saved as ' + data.name + ')' : 'Done ✓');
       } else {
-        fail((data && data.error) ? data.error : 'The TV reported error ' + xhr.status);
+        finish(item, 'failed', 'Error: ' + ((data && data.error) ? data.error : 'the laptop reported ' + xhr.status));
       }
-      next();
     };
-
-    // No answer at all: connection dropped, server stopped, TV refused the file...
     xhr.onerror = function () {
-      fail('Upload failed. Look at the status line on the laptop for the reason.');
-      next();
+      finish(item, 'failed', 'Error: upload failed. Look at the laptop window for the reason.');
     };
-    xhr.onabort = xhr.onerror;
-
-    function fail(text) {
-      item.state.className = 'state bad';
-      item.state.textContent = 'Error: ' + text;
-    }
-
+    xhr.onabort = function () { finish(item, 'cancelled', 'Cancelled'); };
     xhr.send(item.file);
   }
 
-  // ---- 4. Files the laptop is sharing: show them as download buttons ----
-  var shared = document.getElementById('shared');
+  function finish(item, status, text) {
+    item.status = status;
+    item.xhr = null;
+    item.state.textContent = text;
+    item.state.className = 'state' + (status === 'done' ? ' ok' : (status === 'failed' ? ' bad' : ''));
+    if (status === 'done') { item.button.style.display = 'none'; }
+    else { item.button.textContent = 'Retry'; }
+    if (active === item) { active = null; }
+    pump();
+  }
+
+  function summary() {
+    var done = 0, failed = 0;
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].status === 'done') { done++; }
+      if (items[i].status === 'failed') { failed++; }
+    }
+    if (items.length === 0) { message.textContent = ''; }
+    else if (failed > 0) { message.textContent = done + ' sent, ' + failed + ' failed. Tap Retry on the failed ones.'; }
+    else { message.textContent = done + ' file(s) sent ✓'; }
+  }
+
+  // ---------------------------------------------------------------
+  // 2. Files (and text) the laptop is sharing
+  // ---------------------------------------------------------------
+  var shared = $('shared');
   var shownList = null;     // what is on screen now, to avoid redrawing for nothing
-  var deniedPin = null;     // a PIN the laptop already refused: do not try it again
 
   function loadShared() {
-    if (busy) { return; }
     var pin = pinInput.value;
     if (pinRequired && (pin.length !== 4 || pin === deniedPin)) {
       shared.textContent = 'Type the PIN shown on the laptop to see the files.';
+      $('fromLaptop').style.display = 'none';
       shownList = null;
       return;
     }
-    request('GET', '/api/files', function (status, data) {
+    request('GET', '/api/files', null, function (status, data) {
       if (status === 403) {
         deniedPin = pin;
         shownList = null;
@@ -284,47 +345,105 @@ PAGE = r"""<!DOCTYPE html>
         return;
       }
       if (status !== 200 || !data) { return; }
+      okPin = pin;
+
+      // Text from the laptop
+      var box = $('fromLaptop');
+      if (data.text) {
+        if ($('textIn').value !== data.text) { $('textIn').value = data.text; }
+        box.style.display = 'block';
+      } else {
+        box.style.display = 'none';
+      }
+
+      // Files from the laptop
       var key = JSON.stringify(data.files) + pin;
       if (key === shownList) { return; }
       shownList = key;
       shared.innerHTML = '';
       if (data.files.length === 0) {
-        shared.textContent = 'Nothing is shared right now. On the laptop, click "Send files to iPad / iPhone".';
+        shared.textContent = 'Nothing is shared right now. In the laptop window, click "Add files".';
         return;
       }
-      for (var i = 0; i < data.files.length; i++) {
-        var f = data.files[i];
-        var link = document.createElement('a');
-        link.className = 'btn';
-        link.href = '/download?id=' + encodeURIComponent(f.id) + '&pin=' + encodeURIComponent(pin);
-        link.setAttribute('download', f.name);
-        link.textContent = 'Download: ' + f.name + '  (' + readableSize(f.size) + ')';
-        shared.appendChild(link);
-      }
+      for (var i = 0; i < data.files.length; i++) { shared.appendChild(sharedRow(data.files[i], pin)); }
     });
   }
 
-  // Ask once the PIN question is settled, then again every 4 seconds.
-  setTimeout(loadShared, 600);
-  setInterval(loadShared, 4000);
-  pinInput.addEventListener('input', loadShared);
+  function sharedRow(f, pin) {
+    var link = '/download?id=' + encodeURIComponent(f.id) + '&pin=' + encodeURIComponent(pin);
+    var card = el('div', 'card');
+    card.appendChild(el('div', 'name', f.name));
+    card.appendChild(el('div', 'size', readableSize(f.size)));
+    var actions = el('div', 'actions');
+    var get = el('a', 'small go', 'Download');
+    get.href = link;
+    get.setAttribute('download', f.name);
+    actions.appendChild(get);
+    if (f.view) {                       // photos, videos, music, PDFs: open without saving
+      var view = el('a', 'small', 'View');
+      view.href = link + '&view=1';
+      view.target = '_blank';
+      actions.appendChild(view);
+    }
+    card.appendChild(actions);
+    return card;
+  }
 
-  // ---- Small helpers ----
+  setInterval(loadShared, 3000);        // look for changes every 3 seconds
 
-  function setBusy(value) {
-    busy = value;
-    uploadBtn.disabled = value;
-    picker.disabled = value;
+  // ---------------------------------------------------------------
+  // 3. Text
+  // ---------------------------------------------------------------
+  $('textBtn').addEventListener('click', function () {
+    var text = $('textOut').value;
+    if (!text.trim()) { $('textMessage').textContent = 'Type some text first.'; return; }
+    if (pinRequired && pinInput.value.length !== 4) {
+      $('textMessage').textContent = 'Type the 4-digit PIN shown on the laptop.';
+      return;
+    }
+    $('textMessage').textContent = 'Sending…';
+    request('POST', '/api/text', text, function (status, data) {
+      if (status === 200) {
+        $('textMessage').textContent = 'Sent ✓  It is now in the laptop clipboard (Ctrl+V to paste).';
+        $('textOut').value = '';
+      } else {
+        $('textMessage').textContent = (data && data.error) ? data.error : 'Could not send the text.';
+      }
+    });
+  });
+
+  // navigator.clipboard only works on https pages, so we use the older way:
+  // select the text, then ask the browser to copy the selection.
+  $('copyBtn').addEventListener('click', function () {
+    var box = $('textIn');
+    box.focus();
+    box.select();
+    box.setSelectionRange(0, box.value.length);
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    $('copyBtn').textContent = ok ? 'Copied ✓' : 'Select the text and copy it';
+    setTimeout(function () { $('copyBtn').textContent = 'Copy'; }, 2000);
+  });
+
+  // ---------------------------------------------------------------
+  // Small helpers
+  // ---------------------------------------------------------------
+  function el(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) { node.className = className; }
+    if (text !== undefined) { node.textContent = text; }
+    return node;
   }
 
   // A small request that sends the PIN and gives back (status, parsed JSON).
-  function request(method, url, callback) {
+  function request(method, url, body, callback) {
     var xhr = new XMLHttpRequest();
     xhr.open(method, url);
     xhr.setRequestHeader('X-Pin', pinInput.value);
+    if (body !== null) { xhr.setRequestHeader('Content-Type', 'text/plain; charset=utf-8'); }
     xhr.onload = function () { callback(xhr.status, parse(xhr.responseText)); };
     xhr.onerror = function () { callback(0, null); };
-    xhr.send();
+    xhr.send(body);
   }
 
   function parse(text) {
@@ -335,7 +454,16 @@ PAGE = r"""<!DOCTYPE html>
     if (bytes >= 1073741824) { return (bytes / 1073741824).toFixed(2) + ' GB'; }
     if (bytes >= 1048576) { return (bytes / 1048576).toFixed(1) + ' MB'; }
     if (bytes >= 1024) { return Math.round(bytes / 1024) + ' KB'; }
-    return bytes + ' bytes';
+    return Math.round(bytes) + ' bytes';
+  }
+
+  function readableTime(seconds) {
+    if (!isFinite(seconds)) { return '…'; }
+    seconds = Math.ceil(seconds);
+    if (seconds < 60) { return seconds + ' s'; }
+    var minutes = Math.floor(seconds / 60);
+    if (minutes < 60) { return minutes + ' min ' + (seconds % 60) + ' s'; }
+    return Math.floor(minutes / 60) + ' h ' + (minutes % 60) + ' min';
   }
 })();
 </script>
@@ -354,23 +482,27 @@ class State:
         self.pin_enabled = False
         self.pin = ""
         self.status = "Server is stopped"
-        self.recent = []            # newest first
-        self.shared = []            # files offered to the iPad: {"id", "path", "name", "size"}
+        self.recent = []              # received files, newest first (text lines)
+        self.shared = []              # files offered to other devices: {"id","path","name","size"}
+        self.text_out = ""            # text the laptop offers to other devices
+        self.text_in = ""             # the last text received from a device
+        self.text_in_count = 0        # goes up by one for every received text
         self.wrong_pins = 0
         self.locked_until = 0.0
-        self.changes = queue.Queue()  # the window waits on this for "something changed"
+        self.changes = queue.Queue()  # the window checks this for "something changed"
         self.load()
 
+    # ----- settings that survive closing the app -----
+
     def load(self):
-        """Read the remembered settings (folder, PIN, recent files)."""
         try:
             data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            self.folder = data.get("folder", self.folder)
+            self.folder = str(data.get("folder", self.folder))
             self.pin_enabled = bool(data.get("pin_enabled", False))
             self.pin = str(data.get("pin", ""))
-            self.recent = list(data.get("recent", []))[:8]
+            self.recent = [str(line) for line in data.get("recent", [])][:8]
         except Exception:
-            pass                    # first run, or a damaged file: use the defaults
+            pass                      # first run, or a damaged file: use the defaults
 
     def save(self):
         try:
@@ -383,6 +515,8 @@ class State:
         except Exception:
             pass
 
+    # ----- things the server threads report -----
+
     def set_status(self, text):
         self.status = text
         self.changes.put(True)
@@ -394,15 +528,22 @@ class State:
             self.save()
         self.changes.put(True)
 
+    def receive_text(self, text):
+        with self.lock:
+            self.text_in = text
+            self.text_in_count += 1
+        self.set_status("Text received ✓ (copied to the clipboard)")
+
+    # ----- files offered to other devices -----
 
     def share(self, paths):
-        """Offer these laptop files for download on the iPad."""
         with self.lock:
             already = {entry["path"] for entry in self.shared}
             for path in paths:
                 path = os.path.abspath(path)
                 if path in already or not os.path.isfile(path):
                     continue
+                already.add(path)
                 self.shared.append({
                     # A random id, so nobody can guess the download address of a file.
                     "id": secrets.token_urlsafe(9),
@@ -410,6 +551,11 @@ class State:
                     "name": os.path.basename(path),
                     "size": os.path.getsize(path),
                 })
+        self.changes.put(True)
+
+    def unshare(self, ids):
+        with self.lock:
+            self.shared = [e for e in self.shared if e["id"] not in ids]
         self.changes.put(True)
 
     def clear_shared(self):
@@ -435,7 +581,7 @@ def local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         # No data is sent. We only ask the system "which of my addresses
-        # would you use to reach the outside?" - that is the Wi-Fi address.
+        # would you use to reach the network?" - that is the Wi-Fi address.
         s.connect(("10.255.255.255", 1))
         return s.getsockname()[0]
     except Exception:
@@ -447,13 +593,32 @@ def local_ip():
         s.close()
 
 
-WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+def keep_awake(on):
+    """
+    Windows only: stop the laptop from going to sleep while a file is moving.
+    The setting belongs to the thread that asks for it, so every transfer
+    switches it on for itself and off again when it ends.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if on else 0))
+    except Exception:
+        pass
+
+
+WINDOWS_RESERVED = ({"CON", "PRN", "AUX", "NUL"}
+                    | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)})
 
 
 def clean_file_name(raw):
-    """Make a file name from the iPad safe to use on this laptop."""
+    """Make a file name from another device safe to use on this laptop."""
     name = raw.replace("\\", "/").split("/")[-1]              # no folder parts
-    name = "".join("_" if c in '\\/:*?"<>|' else c for c in name if ord(c) >= 32 and ord(c) != 127)
+    name = "".join("_" if c in '\\/:*?"<>|' else c
+                   for c in name if ord(c) >= 32 and ord(c) != 127)
     name = name.strip().lstrip(".").rstrip(". ")
     if not name:
         name = "file"
@@ -468,22 +633,47 @@ def clean_file_name(raw):
     return name
 
 
-def open_unique(folder, name):
-    """
-    Create a NEW file in folder and open it for writing.
-    Never overwrites: video.mp4 -> video (1).mp4 -> video (2).mp4 ...
-    Mode "xb" means: create, and fail if the file already exists.
-    """
+def numbered(name, n):
+    """numbered("video.mp4", 0) = "video.mp4",  numbered("video.mp4", 2) = "video (2).mp4" """
+    if n == 0:
+        return name
     stem, dot, ext = name.rpartition(".")
     if not dot or not stem:
-        stem, ext = name, ""
-    for n in range(10000):
-        candidate = name if n == 0 else (f"{stem} ({n}).{ext}" if ext else f"{stem} ({n})")
-        path = os.path.join(folder, candidate)
-        try:
-            return open(path, "xb"), path, candidate
-        except FileExistsError:
-            continue
+        return f"{name} ({n})"
+    return f"{stem} ({n}).{ext}"
+
+
+# Only one thread at a time may pick a file name, so two uploads with the
+# same name can never grab the same file.
+name_lock = threading.Lock()
+
+
+def create_part_file(folder, name):
+    """
+    Open a temporary "<name>.part" file for writing.
+    While a file is arriving it is called e.g. "video.mp4.part"; only a
+    complete file gets its real name. So a file without ".part" is always whole.
+    """
+    with name_lock:
+        for n in range(10000):
+            final = os.path.join(folder, numbered(name, n))
+            part = final + ".part"
+            if os.path.exists(final) or os.path.exists(part):
+                continue
+            return open(part, "xb"), part          # "xb" = create, fail if it exists
+    raise OSError("Too many files with the same name")
+
+
+def finish_part_file(part, folder, name):
+    """Give a completed .part file its real name. Never overwrites: adds (1), (2), ..."""
+    with name_lock:
+        for n in range(10000):
+            candidate = numbered(name, n)
+            final = os.path.join(folder, candidate)
+            if os.path.exists(final):
+                continue
+            os.rename(part, final)
+            return candidate
     raise OSError("Too many files with the same name")
 
 
@@ -494,22 +684,49 @@ def readable_size(n):
         return f"{n / 1024 ** 2:.1f} MB"
     if n >= 1024:
         return f"{n // 1024} KB"
-    return f"{n} bytes"
+    return f"{int(n)} bytes"
 
 
 def friendly(error):
     """Turn a technical error into a sentence a person can act on."""
-    text = str(error)
     if isinstance(error, OSError) and getattr(error, "errno", None) == 28:
         return "The disk is full"
     if isinstance(error, (ConnectionError, TimeoutError, socket.timeout)):
-        return "The connection was lost"
-    return text or error.__class__.__name__
+        return "The connection was lost or the transfer was cancelled"
+    return str(error) or error.__class__.__name__
+
+
+def can_view(name):
+    """True for files a browser can show directly: photos, videos, music, PDFs, plain text."""
+    kind = mimetypes.guess_type(name)[0] or ""
+    if kind in ("image/svg+xml", "text/html"):
+        return False                       # these could run scripts, so download only
+    return kind.startswith(("image/", "video/", "audio/")) or kind in ("application/pdf", "text/plain")
+
+
+def parse_range(header, size):
+    """
+    Browsers ask for a part of a file with a header such as "bytes=1000-1999".
+    That is how video players jump around and how downloads resume.
+    Returns (first, last), or None for "the whole file", or "bad" for nonsense.
+    """
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", (header or "").strip())
+    if not match or (match.group(1) == "" and match.group(2) == ""):
+        return None
+    if match.group(1) == "":                        # "bytes=-500" = the last 500 bytes
+        count = int(match.group(2))
+        if count == 0 or size == 0:
+            return "bad"
+        return max(0, size - count), size - 1
+    first = int(match.group(1))
+    last = min(int(match.group(2)), size - 1) if match.group(2) else size - 1
+    if first >= size or first > last:
+        return "bad"
+    return first, last
 
 
 def check_pin(given):
     """Returns None if the PIN is fine (or not needed), else an error text."""
-    import time
     with state.lock:
         if not state.pin_enabled:
             return None
@@ -523,12 +740,20 @@ def check_pin(given):
         if state.wrong_pins >= 5:               # 5 wrong tries -> locked for 60 seconds
             state.wrong_pins = 0
             state.locked_until = now + 60
-        return "Wrong PIN. Look at the laptop screen."
+        return "Wrong PIN. Look at the laptop window."
 
 
 # ----------------------------------------------------------------------
 # The web server. Python calls do_GET / do_POST for every request,
 # each on its own background thread.
+#
+#   GET  /              the web page
+#   GET  /api/info      laptop name + "is a PIN needed?"      (no PIN required)
+#   GET  /api/check     is this PIN right?
+#   GET  /api/files     shared files + shared text
+#   GET  /download      one shared file (download or view)
+#   POST /api/upload    receive one file; the request body IS the file
+#   POST /api/text      receive a piece of text
 # ----------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -536,6 +761,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):    # keep the console quiet
         pass
+
+    # ----- answering -----
 
     def reply(self, code, body, content_type, close=False):
         if isinstance(body, str):
@@ -553,35 +780,45 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def reply_json(self, code, data, close=False):
-        self.reply(code, json.dumps(data, ensure_ascii=False), "application/json; charset=utf-8", close)
+        self.reply(code, json.dumps(data, ensure_ascii=False),
+                   "application/json; charset=utf-8", close)
+
+    def fail(self, code, message, close=True):
+        self.reply_json(code, {"ok": False, "error": message}, close)
+
+    def header_pin(self):
+        return self.headers.get("X-Pin", "").strip()
+
+    # ----- GET -----
 
     def do_GET(self):
-        path = urlsplit(self.path).path
+        url = urlsplit(self.path)
+        path = url.path
         if path in ("/", "/index.html"):
             self.reply(200, PAGE, "text/html; charset=utf-8")
         elif path == "/api/info":
-            self.reply_json(200, {"pin": state.pin_enabled})
+            self.reply_json(200, {"pin": state.pin_enabled, "name": socket.gethostname()})
         elif path == "/api/check":
-            problem = check_pin(self.headers.get("X-Pin", "").strip())
+            problem = check_pin(self.header_pin())
             if problem is None:
                 self.reply_json(200, {"ok": True})
             else:
-                self.reply_json(403, {"ok": False, "error": problem})
+                self.fail(403, problem, close=False)
         elif path == "/api/files":
-            # The list of files the laptop offers for download.
-            problem = check_pin(self.headers.get("X-Pin", "").strip())
-            if problem is None:
-                files = [{"id": e["id"], "name": e["name"], "size": e["size"]} for e in state.shared_list()]
-                self.reply_json(200, {"files": files})
-            else:
-                self.reply_json(403, {"ok": False, "error": problem})
+            problem = check_pin(self.header_pin())
+            if problem is not None:
+                self.fail(403, problem, close=False)
+                return
+            files = [{"id": e["id"], "name": e["name"], "size": e["size"], "view": can_view(e["name"])}
+                     for e in state.shared_list()]
+            self.reply_json(200, {"files": files, "text": state.text_out})
         elif path == "/download":
-            self.send_shared_file(parse_qs(urlsplit(self.path).query))
+            self.send_shared_file(parse_qs(url.query))
         else:
-            self.reply_json(404, {"ok": False, "error": "Not found"})
+            self.fail(404, "Not found", close=False)
 
     def send_shared_file(self, query):
-        """Laptop -> iPad: stream one shared file to the browser as a download."""
+        """Laptop -> device: stream one shared file, whole or in part."""
         problem = check_pin(query.get("pin", [""])[0].strip())
         if problem is not None:
             self.reply(403, problem, "text/plain; charset=utf-8")
@@ -599,103 +836,158 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         name = entry["name"]
+        viewing = query.get("view", [""])[0] == "1" and can_view(name)
+        wanted_range = parse_range(self.headers.get("Range"), size)
+        if wanted_range == "bad":
+            source.close()
+            self.send_response(416)                       # "that part does not exist"
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        first, last = wanted_range if wanted_range else (0, size - 1)
+        count = last - first + 1
+
         # Headers may only contain simple characters, so the name is sent twice:
         # a plain fallback, and the real name (Arabic etc.) in the encoded form.
         plain = "".join(c if 32 <= ord(c) < 127 and c not in '"\\' else "_" for c in name)
-        self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Length", str(size))
+        how = "inline" if viewing else "attachment"
+        kind = (mimetypes.guess_type(name)[0] or "application/octet-stream") if viewing \
+            else "application/octet-stream"
+
+        self.send_response(206 if wanted_range else 200)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(count))
+        self.send_header("Accept-Ranges", "bytes")
+        if wanted_range:
+            self.send_header("Content-Range", f"bytes {first}-{last}/{size}")
         self.send_header("Content-Disposition",
-                         f"attachment; filename=\"{plain}\"; filename*=UTF-8''{quote(name)}")
+                         f"{how}; filename=\"{plain}\"; filename*=UTF-8''{quote(name)}")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
         sent = 0
         last_percent = -1
+        keep_awake(True)
         try:
             with source:
-                while sent < size:
-                    chunk = source.read(min(BUFFER_SIZE, size - sent))   # 64 KB at a time
+                source.seek(first)
+                while sent < count:
+                    chunk = source.read(min(BUFFER_SIZE, count - sent))   # 64 KB at a time
                     if not chunk:
                         break
                     self.wfile.write(chunk)
                     sent += len(chunk)
-                    percent = sent * 100 // size
+                    if viewing:
+                        continue          # a video player asks for many small parts: no % shown
+                    percent = (first + sent) * 100 // size
                     if percent != last_percent:
                         last_percent = percent
                         state.set_status(f"Sending {name} – {percent}%")
-            if sent == size:
-                state.set_status(f"Sent {name} ✓")
-            else:
+            if sent != count:
                 self.close_connection = True
+            elif viewing:
+                state.set_status(f"Showing {name} on the other device")
+            elif last == size - 1:
+                state.set_status(f"Sent {name} ✓")
         except Exception:
-            # The iPad cancelled the download or the Wi-Fi dropped.
+            # The other device cancelled, closed the video, or the Wi-Fi dropped.
             self.close_connection = True
-            state.set_status(f"Sending {name} stopped")
+            if not viewing:
+                state.set_status(f"Sending {name} stopped")
+        finally:
+            keep_awake(False)
+
+    # ----- POST -----
 
     def do_POST(self):
         url = urlsplit(self.path)
-        if url.path != "/api/upload":
-            self.reply_json(404, {"ok": False, "error": "Not found"}, close=True)
+        if url.path not in ("/api/upload", "/api/text"):
+            self.fail(404, "Not found")
             return
 
-        # 1. PIN
-        problem = check_pin(self.headers.get("X-Pin", "").strip())
+        problem = check_pin(self.header_pin())
         if problem is not None:
-            self.reply_json(403, {"ok": False, "error": problem}, close=True)
+            self.fail(403, problem)
             return
-
-        # 2. File name (?name=...) and size (Content-Length header)
-        name = clean_file_name(parse_qs(url.query).get("name", ["file"])[0])
         try:
             length = int(self.headers.get("Content-Length", ""))
             if length < 0:
                 raise ValueError
         except ValueError:
-            self.reply_json(400, {"ok": False, "error": "Missing file size"}, close=True)
+            self.fail(400, "Missing size")
             return
 
-        # 3. Create the empty file in the chosen folder
+        if url.path == "/api/text":
+            self.receive_text(length)
+        else:
+            self.receive_file(length, parse_qs(url.query).get("name", ["file"])[0])
+
+    def receive_text(self, length):
+        if length > MAX_TEXT_BYTES:
+            self.fail(413, "That text is too long")
+            return
+        text = self.rfile.read(length).decode("utf-8", errors="replace")
+        if not text.strip():
+            self.fail(400, "The text is empty", close=False)
+            return
+        state.receive_text(text)
+        self.reply_json(200, {"ok": True})
+
+    def receive_file(self, length, raw_name):
+        """Device -> laptop: the request body is the file. Copy it straight to disk."""
+        name = clean_file_name(raw_name)
         folder = state.folder
+
+        # 1. Is there room? Then create the temporary ".part" file.
         try:
             os.makedirs(folder, exist_ok=True)
-            out, path, saved_name = open_unique(folder, name)
+            if shutil.disk_usage(folder).free < length:
+                raise OSError("Not enough free space on the laptop")
+            out, part = create_part_file(folder, name)
         except Exception as e:
             reason = friendly(e)
             state.set_status(f"Failed: {name} – {reason}")
-            self.reply_json(500, {"ok": False, "error": reason}, close=True)
+            self.fail(500, reason)
             return
 
-        # 4. Copy: network -> 64 KB buffer -> disk, again and again
+        # 2. Copy: network -> 64 KB buffer -> disk, again and again.
         received = 0
         last_percent = -1
+        started = time.time()
+        keep_awake(True)
         try:
             with out:
                 while received < length:
                     chunk = self.rfile.read(min(BUFFER_SIZE, length - received))
                     if not chunk:
-                        raise ConnectionError("The connection was lost")
+                        raise ConnectionError("lost")
                     out.write(chunk)
                     received += len(chunk)
                     percent = received * 100 // length
                     if percent != last_percent:
                         last_percent = percent
-                        state.set_status(f"Receiving {saved_name} – {percent}%")
+                        seconds = time.time() - started
+                        speed = f"  ({readable_size(received / seconds)}/s)" if seconds > 1 else ""
+                        state.set_status(f"Receiving {name} – {percent}%{speed}")
+            # 3. Complete: give the file its real name.
+            saved_name = finish_part_file(part, folder, name)
         except Exception as e:
             # Delete the half-written file so no broken files are left behind.
             try:
-                os.remove(path)
+                os.remove(part)
             except OSError:
                 pass
             reason = friendly(e)
-            state.set_status(f"Failed: {name} – {reason}")
+            state.set_status(f"Stopped: {name} – {reason}")
             try:
-                self.reply_json(500, {"ok": False, "error": reason}, close=True)
+                self.fail(500, reason)
             except Exception:
                 pass
             return
+        finally:
+            keep_awake(False)
 
-        # 5. Done
         state.add_recent(f"{saved_name}  ({readable_size(length)})")
         state.set_status(f"Received {saved_name} ✓")
         self.reply_json(200, {"ok": True, "name": saved_name})
@@ -733,7 +1025,7 @@ class ServerControl:
             state.set_status("Could not start the server (ports 8080-8089 are busy)")
             return
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
-        state.set_status("Waiting for files…")
+        state.set_status("Ready. Waiting for a device…")
 
     def stop(self):
         if not self.running:
@@ -744,9 +1036,10 @@ class ServerControl:
         state.set_status("Server is stopped")
 
     def address(self):
-        ip = local_ip()
+        """The address to open on the other device, or None."""
         if not self.running:
             return None
+        ip = local_ip()
         return f"http://{ip}:{self.port}" if ip else None
 
 
@@ -757,40 +1050,75 @@ def run_window(control):
     import tkinter as tk
     from tkinter import filedialog
 
-    BG, FG, DIM, ACCENT, BTN = "#101826", "#ffffff", "#9fb0c8", "#ffd54f", "#2d3b55"
+    BG, PANEL, FG, DIM, ACCENT = "#101826", "#0b111c", "#ffffff", "#9fb0c8", "#ffd54f"
+    BTN, PRIMARY, LINE = "#2d3b55", "#1e88e5", "#24324a"
+    FONT = "Segoe UI"
 
     root = tk.Tk()
-    root.title("Laptop File Drop")
-    root.configure(bg=BG, padx=28, pady=22)
-    root.minsize(820, 680)
+    root.title(APP_NAME)
+    root.configure(bg=BG)
+    root.minsize(1000, 680)
 
-    def label(text="", size=12, color=FG, bold=False, **kw):
-        font = ("Segoe UI", size, "bold" if bold else "normal")
-        w = tk.Label(root, text=text, font=font, fg=color, bg=BG, anchor="w", justify="left", **kw)
-        w.pack(fill="x")
-        return w
+    # Two columns: left = how to connect, right = everything else.
+    left = tk.Frame(root, bg=BG, padx=26, pady=22)
+    left.pack(side="left", fill="y")
+    tk.Frame(root, bg=LINE, width=1).pack(side="left", fill="y")
+    right = tk.Frame(root, bg=BG, padx=26, pady=22)
+    right.pack(side="left", fill="both", expand=True)
 
-    def button(parent, text, command):
-        return tk.Button(parent, text=text, command=command, font=("Segoe UI", 12, "bold"),
-                         fg=FG, bg=BTN, activebackground=ACCENT, activeforeground=BG,
-                         relief="flat", padx=16, pady=8, cursor="hand2")
+    # ----- small helpers that build widgets -----
 
-    label("Laptop File Drop", 20, bold=True)
-    label("On your iPad, open Safari and go to:", 11, DIM)
-    address_label = label("", 24, ACCENT, bold=True)
-    pin_label = label("", 13)
+    def label(parent, text="", size=11, color=FG, bold=False, wrap=0):
+        widget = tk.Label(parent, text=text, font=(FONT, size, "bold" if bold else "normal"),
+                          fg=color, bg=BG, anchor="w", justify="left", wraplength=wrap)
+        widget.pack(fill="x")
+        return widget
 
-    qr_canvas = tk.Canvas(root, width=1, height=1, bg=BG, highlightthickness=0)
-    qr_canvas.pack(anchor="w", pady=(6, 6))
+    def heading(parent, text, first=False):
+        if not first:
+            tk.Frame(parent, bg=LINE, height=1).pack(fill="x", pady=(14, 10))
+        return label(parent, text, 10, DIM, bold=True)
 
-    label("Files are saved to:", 11, DIM)
-    folder_label = label("", 12, wraplength=700)
+    def row(parent):
+        frame = tk.Frame(parent, bg=BG)
+        frame.pack(fill="x", pady=6)
+        return frame
 
-    row = tk.Frame(root, bg=BG)
-    row.pack(fill="x", pady=10)
+    def button(parent, text, command, primary=False):
+        widget = tk.Button(parent, text=text, command=command, font=(FONT, 10, "bold"),
+                           fg=FG, bg=PRIMARY if primary else BTN,
+                           activebackground=ACCENT, activeforeground=BG,
+                           relief="flat", padx=14, pady=7, cursor="hand2")
+        widget.pack(side="left", padx=(0, 8))
+        return widget
+
+    # ----- actions -----
+
+    def toggle_server():
+        if control.running:
+            control.stop()
+        else:
+            control.start()
+        refresh()
+
+    def toggle_pin():
+        with state.lock:
+            state.pin_enabled = not state.pin_enabled
+            if state.pin_enabled:
+                state.pin = f"{secrets.randbelow(10000):04d}"    # new random 4 digits
+            state.save()
+        refresh()
+
+    def copy_address():
+        address = control.address()
+        if address:
+            root.clipboard_clear()
+            root.clipboard_append(address)
+            state.set_status("Address copied to the clipboard")
 
     def change_folder():
-        chosen = filedialog.askdirectory(initialdir=state.folder if os.path.isdir(state.folder) else str(Path.home()),
+        start = state.folder if os.path.isdir(state.folder) else str(Path.home())
+        chosen = filedialog.askdirectory(initialdir=start,
                                          title="Where should received files be saved?")
         if chosen:
             state.folder = os.path.normpath(chosen)
@@ -806,48 +1134,99 @@ def run_window(control):
         else:
             os.system(f'xdg-open "{state.folder}"')
 
-    def toggle_server():
-        control.stop() if control.running else control.start()
-        refresh()
-
-    def toggle_pin():
-        with state.lock:
-            state.pin_enabled = not state.pin_enabled
-            if state.pin_enabled:
-                state.pin = f"{secrets.randbelow(10000):04d}"   # new random 4 digits
-            state.save()
-        refresh()
-
-    button(row, "Change folder", change_folder).pack(side="left")
-    button(row, "Open folder", open_folder).pack(side="left", padx=8)
-    server_button = button(row, "", toggle_server)
-    server_button.pack(side="left")
-    pin_button = button(row, "", toggle_pin)
-    pin_button.pack(side="left", padx=8)
-
-    # ---- Laptop -> iPad ----
-    label("Send to iPad / iPhone (they appear as download buttons on the web page):", 11, DIM)
-    send_row = tk.Frame(root, bg=BG)
-    send_row.pack(fill="x", pady=8)
-
-    def send_files():
-        chosen = filedialog.askopenfilenames(title="Choose files to send to the iPad / iPhone")
+    def add_files():
+        chosen = filedialog.askopenfilenames(title="Choose files to send")
         if chosen:
             state.share(chosen)
             refresh()
 
-    def clear_send_list():
+    def add_folder():
+        chosen = filedialog.askdirectory(title="Choose a folder: every file in it will be shared")
+        if not chosen:
+            return
+        paths = []
+        for folder, _subfolders, files in os.walk(chosen):
+            for name in sorted(files):
+                paths.append(os.path.join(folder, name))
+        if len(paths) > 500:
+            state.set_status(f"That folder has {len(paths)} files; sharing the first 500")
+            paths = paths[:500]
+        state.share(paths)
+        refresh()
+
+    def remove_selected():
+        ids = [shown_ids[i] for i in shared_box.curselection() if i < len(shown_ids)]
+        if ids:
+            state.unshare(ids)
+            refresh()
+
+    def clear_shared():
         state.clear_shared()
         refresh()
 
-    button(send_row, "Send files to iPad / iPhone…", send_files).pack(side="left")
-    button(send_row, "Clear send list", clear_send_list).pack(side="left", padx=8)
-    shared_label = label("", 11, wraplength=760)
+    def share_clipboard():
+        try:
+            text = root.clipboard_get()
+        except tk.TclError:
+            text = ""
+        if not text.strip():
+            state.set_status("The clipboard has no text. Copy some text first (Ctrl+C).")
+            return
+        state.text_out = text[:MAX_TEXT_BYTES]
+        state.set_status("Clipboard text is now shown on the web page")
+        refresh()
 
-    label("Status:", 11, DIM)
-    status_label = label("", 14, ACCENT, wraplength=700)
-    label("Last files received:", 11, DIM)
-    recent_label = label("", 11, wraplength=700)
+    def stop_text():
+        state.text_out = ""
+        refresh()
+
+    # ----- left column: connect -----
+
+    label(left, APP_NAME, 20, bold=True)
+    label(left, "On the phone or tablet, open\nthe browser and go to:", 11, DIM)
+    address_label = label(left, "", 17, ACCENT, bold=True)
+    qr_canvas = tk.Canvas(left, width=1, height=1, bg=BG, highlightthickness=0)
+    qr_canvas.pack(anchor="w", pady=(10, 10))
+    pin_label = label(left, "", 12, wrap=280)
+    left_buttons = row(left)
+    server_button = button(left_buttons, "", toggle_server, primary=True)
+    pin_button = button(left_buttons, "", toggle_pin)
+    button(row(left), "Copy address", copy_address)
+    label(left, "Both devices must be on\nthe same Wi-Fi.", 10, DIM)
+
+    # ----- right column -----
+
+    heading(right, "RECEIVE  ·  files sent to this laptop are saved in", first=True)
+    folder_label = label(right, "", 11, wrap=600)
+    folder_row = row(right)
+    button(folder_row, "Change folder", change_folder)
+    button(folder_row, "Open folder", open_folder)
+
+    heading(right, "SEND  ·  files offered to the phone or tablet")
+    send_row = row(right)
+    button(send_row, "Add files…", add_files, primary=True)
+    button(send_row, "Add folder…", add_folder)
+    button(send_row, "Remove selected", remove_selected)
+    button(send_row, "Clear", clear_shared)
+    shared_box = tk.Listbox(right, height=5, bg=PANEL, fg=FG, font=(FONT, 10),
+                            selectbackground=PRIMARY, selectforeground=FG, selectmode="extended",
+                            relief="flat", highlightthickness=0, activestyle="none")
+    shared_box.pack(fill="x")
+    shown_ids = []                  # the ids of the files shown in the list, same order
+
+    heading(right, "TEXT  ·  links, notes, codes")
+    text_row = row(right)
+    button(text_row, "Share clipboard text", share_clipboard)
+    button(text_row, "Stop sharing text", stop_text)
+    text_out_label = label(right, "", 10, DIM, wrap=600)
+    text_in_label = label(right, "", 10, wrap=600)
+
+    heading(right, "ACTIVITY")
+    status_label = label(right, "", 13, ACCENT, wrap=600)
+    label(right, "Last files received:", 10, DIM)
+    recent_label = label(right, "", 10, wrap=600)
+
+    # ----- drawing -----
 
     shown_qr = [None]
 
@@ -857,18 +1236,18 @@ def run_window(control):
             return
         shown_qr[0] = text
         qr_canvas.delete("all")
-        qr_canvas.config(width=1, height=1)
+        qr_canvas.config(width=1, height=1, bg=BG)
         if not text:
             return
         try:
             import qrcode
         except ImportError:
             return                                           # no package: simply no QR code
-        qr = qrcode.QRCode(border=2)
-        qr.add_data(text)
-        qr.make()
-        matrix = qr.get_matrix()                             # rows of True/False
-        cell = max(4, 210 // len(matrix))
+        code = qrcode.QRCode(border=2)
+        code.add_data(text)
+        code.make()
+        matrix = code.get_matrix()                           # rows of True/False
+        cell = max(4, 230 // len(matrix))
         size = cell * len(matrix)
         qr_canvas.config(width=size, height=size, bg="white")
         for y, line in enumerate(matrix):
@@ -877,6 +1256,10 @@ def run_window(control):
                     qr_canvas.create_rectangle(x * cell, y * cell, (x + 1) * cell, (y + 1) * cell,
                                                fill="black", width=0)
 
+    def one_line(text, limit=90):
+        text = " ".join(text.split())
+        return text if len(text) <= limit else text[:limit] + "…"
+
     def refresh():
         """Put the current state on the screen."""
         address = control.address()
@@ -884,20 +1267,30 @@ def run_window(control):
             address_label.config(text="Server is stopped")
         else:
             address_label.config(text=address or "No network connection")
-        draw_qr(address if control.running else None)
+        draw_qr(address)
         pin_label.config(text=f"PIN:  {state.pin}" if state.pin_enabled
-                         else "PIN: off (anyone on your Wi-Fi can send)")
+                         else "PIN is off: anyone on your Wi-Fi can connect")
         pin_button.config(text="Turn PIN off" if state.pin_enabled else "Turn PIN on")
         server_button.config(text="Stop server" if control.running else "Start server")
         folder_label.config(text=state.folder)
-        status_label.config(text=state.status)
+
+        # Redraw the list of shared files only when it really changed,
+        # so the selection is not lost every few seconds.
         sharing = state.shared_list()
-        if sharing:
-            names = ", ".join(e["name"] for e in sharing[:6]) + (" …" if len(sharing) > 6 else "")
-            shared_label.config(text=f"Sharing {len(sharing)} file(s): {names}")
-        else:
-            shared_label.config(text="Not sharing any files")
-        recent_label.config(text="\n".join(state.recent[:6]) or "Nothing yet")
+        ids = [e["id"] for e in sharing]
+        if ids != shown_ids:
+            shown_ids[:] = ids
+            shared_box.delete(0, "end")
+            for e in sharing:
+                shared_box.insert("end", f"  {e['name']}   ({readable_size(e['size'])})")
+
+        text_out_label.config(text=("Sharing: " + one_line(state.text_out)) if state.text_out
+                              else "Not sharing any text")
+        text_in_label.config(text=("Received: " + one_line(state.text_in)) if state.text_in else "")
+        status_label.config(text=state.status)
+        recent_label.config(text="\n".join(state.recent[:5]) or "Nothing yet")
+
+    seen = {"texts": 0, "ticks": 0}
 
     def tick():
         """Runs 4 times a second: redraw if a server thread reported a change."""
@@ -905,12 +1298,15 @@ def run_window(control):
         while not state.changes.empty():
             state.changes.get_nowait()
             changed = True
-        tick.count += 1
-        if changed or tick.count % 20 == 0:                  # also every 5 s (Wi-Fi may change)
+        # A new text arrived: put it in the laptop clipboard, ready for Ctrl+V.
+        if state.text_in_count != seen["texts"]:
+            seen["texts"] = state.text_in_count
+            root.clipboard_clear()
+            root.clipboard_append(state.text_in)
+        seen["ticks"] += 1
+        if changed or seen["ticks"] % 20 == 0:               # also every 5 s (Wi-Fi may change)
             refresh()
         root.after(250, tick)
-
-    tick.count = 0
 
     def on_close():
         control.stop()
@@ -924,27 +1320,35 @@ def run_window(control):
 
 
 def run_console(control):
-    """Fallback without a window:  python laptop_file_drop.py --nogui"""
+    """Fallback without a window:  python laptop_file_drop.py --nogui [files to share]"""
+    def say(*parts):
+        text = " ".join(str(p) for p in parts)
+        try:
+            print(text, flush=True)
+        except UnicodeEncodeError:               # old consoles cannot print every character
+            print(text.encode("ascii", "replace").decode(), flush=True)
+
+    state.share([a for a in sys.argv[1:] if os.path.isfile(a)])
     control.start()
-    print("Laptop File Drop")
-    print("Open in Safari:", control.address() or "(no network connection)")
-    print("Saving to:     ", state.folder)
-    print("PIN:           ", state.pin if state.pin_enabled else "off")
-    print("Press Ctrl+C to stop.")
+    say(APP_NAME)
+    say("Open in the browser:", control.address() or "(no network connection)")
+    say("Saving to:          ", state.folder)
+    say("PIN:                ", state.pin if state.pin_enabled else "off")
+    say("Press Ctrl+C to stop.")
     try:
         while True:
             state.changes.get()
-            print(state.status)
+            say(state.status)
     except KeyboardInterrupt:
         control.stop()
 
 
 if __name__ == "__main__":
-    control = ServerControl()
+    server_control = ServerControl()
     if "--nogui" in sys.argv:
-        run_console(control)
+        run_console(server_control)
     else:
         try:
-            run_window(control)
+            run_window(server_control)
         except ImportError:
-            run_console(control)       # tkinter missing: use the console instead
+            run_console(server_control)        # tkinter missing: use the console instead
