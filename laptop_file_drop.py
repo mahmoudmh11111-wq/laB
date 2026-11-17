@@ -1,8 +1,9 @@
 """
 Laptop File Drop
 ================
-Receive files on this laptop from an iPad / iPhone / any device with a web
-browser, over your home Wi-Fi. It is the laptop version of TV File Drop.
+Move files between this laptop and an iPad / iPhone (or any device with a web
+browser) over your home Wi-Fi, in both directions. It is the laptop version
+of TV File Drop.
 
 How to run:   double-click this file   (or:  python laptop_file_drop.py)
 Needs:        Python 3.8 or newer. Nothing else to install.
@@ -26,7 +27,7 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 FIRST_PORT = 8080
 BUFFER_SIZE = 64 * 1024
@@ -83,6 +84,9 @@ PAGE = r"""<!DOCTYPE html>
   .state { font-size: 18px; color: #9fb0c8; }
   .state.ok { color: #66d98a; }
   .state.bad { color: #ff8a80; }
+  h2 { font-size: 24px; margin: 36px 0 16px; padding-top: 24px; border-top: 2px solid #2d3b55; }
+  a.btn { text-decoration: none; word-break: break-all; font-size: 20px; }
+  #shared { color: #9fb0c8; }
 </style>
 </head>
 <body>
@@ -101,6 +105,9 @@ PAGE = r"""<!DOCTYPE html>
 
 <div id="message"></div>
 <div id="list"></div>
+
+<h2>Get files from the laptop</h2>
+<div id="shared"></div>
 
 <script>
 (function () {
@@ -256,6 +263,52 @@ PAGE = r"""<!DOCTYPE html>
     xhr.send(item.file);
   }
 
+  // ---- 4. Files the laptop is sharing: show them as download buttons ----
+  var shared = document.getElementById('shared');
+  var shownList = null;     // what is on screen now, to avoid redrawing for nothing
+  var deniedPin = null;     // a PIN the laptop already refused: do not try it again
+
+  function loadShared() {
+    if (busy) { return; }
+    var pin = pinInput.value;
+    if (pinRequired && (pin.length !== 4 || pin === deniedPin)) {
+      shared.textContent = 'Type the PIN shown on the laptop to see the files.';
+      shownList = null;
+      return;
+    }
+    request('GET', '/api/files', function (status, data) {
+      if (status === 403) {
+        deniedPin = pin;
+        shownList = null;
+        shared.textContent = (data && data.error) ? data.error : 'Wrong PIN.';
+        return;
+      }
+      if (status !== 200 || !data) { return; }
+      var key = JSON.stringify(data.files) + pin;
+      if (key === shownList) { return; }
+      shownList = key;
+      shared.innerHTML = '';
+      if (data.files.length === 0) {
+        shared.textContent = 'Nothing is shared right now. On the laptop, click "Send files to iPad / iPhone".';
+        return;
+      }
+      for (var i = 0; i < data.files.length; i++) {
+        var f = data.files[i];
+        var link = document.createElement('a');
+        link.className = 'btn';
+        link.href = '/download?id=' + encodeURIComponent(f.id) + '&pin=' + encodeURIComponent(pin);
+        link.setAttribute('download', f.name);
+        link.textContent = 'Download: ' + f.name + '  (' + readableSize(f.size) + ')';
+        shared.appendChild(link);
+      }
+    });
+  }
+
+  // Ask once the PIN question is settled, then again every 4 seconds.
+  setTimeout(loadShared, 600);
+  setInterval(loadShared, 4000);
+  pinInput.addEventListener('input', loadShared);
+
   // ---- Small helpers ----
 
   function setBusy(value) {
@@ -302,6 +355,7 @@ class State:
         self.pin = ""
         self.status = "Server is stopped"
         self.recent = []            # newest first
+        self.shared = []            # files offered to the iPad: {"id", "path", "name", "size"}
         self.wrong_pins = 0
         self.locked_until = 0.0
         self.changes = queue.Queue()  # the window waits on this for "something changed"
@@ -339,6 +393,35 @@ class State:
             del self.recent[8:]
             self.save()
         self.changes.put(True)
+
+
+    def share(self, paths):
+        """Offer these laptop files for download on the iPad."""
+        with self.lock:
+            already = {entry["path"] for entry in self.shared}
+            for path in paths:
+                path = os.path.abspath(path)
+                if path in already or not os.path.isfile(path):
+                    continue
+                self.shared.append({
+                    # A random id, so nobody can guess the download address of a file.
+                    "id": secrets.token_urlsafe(9),
+                    "path": path,
+                    "name": os.path.basename(path),
+                    "size": os.path.getsize(path),
+                })
+        self.changes.put(True)
+
+    def clear_shared(self):
+        with self.lock:
+            self.shared = []
+        self.changes.put(True)
+
+    def shared_list(self):
+        """The shared files that still exist (a file may have been deleted meanwhile)."""
+        with self.lock:
+            self.shared = [e for e in self.shared if os.path.isfile(e["path"])]
+            return list(self.shared)
 
 
 state = State()
@@ -484,8 +567,71 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply_json(200, {"ok": True})
             else:
                 self.reply_json(403, {"ok": False, "error": problem})
+        elif path == "/api/files":
+            # The list of files the laptop offers for download.
+            problem = check_pin(self.headers.get("X-Pin", "").strip())
+            if problem is None:
+                files = [{"id": e["id"], "name": e["name"], "size": e["size"]} for e in state.shared_list()]
+                self.reply_json(200, {"files": files})
+            else:
+                self.reply_json(403, {"ok": False, "error": problem})
+        elif path == "/download":
+            self.send_shared_file(parse_qs(urlsplit(self.path).query))
         else:
             self.reply_json(404, {"ok": False, "error": "Not found"})
+
+    def send_shared_file(self, query):
+        """Laptop -> iPad: stream one shared file to the browser as a download."""
+        problem = check_pin(query.get("pin", [""])[0].strip())
+        if problem is not None:
+            self.reply(403, problem, "text/plain; charset=utf-8")
+            return
+        wanted = query.get("id", [""])[0]
+        entry = next((e for e in state.shared_list() if e["id"] == wanted), None)
+        if entry is None:
+            self.reply(404, "This file is no longer shared.", "text/plain; charset=utf-8")
+            return
+        try:
+            source = open(entry["path"], "rb")
+            size = os.path.getsize(entry["path"])
+        except OSError as e:
+            self.reply(500, friendly(e), "text/plain; charset=utf-8")
+            return
+
+        name = entry["name"]
+        # Headers may only contain simple characters, so the name is sent twice:
+        # a plain fallback, and the real name (Arabic etc.) in the encoded form.
+        plain = "".join(c if 32 <= ord(c) < 127 and c not in '"\\' else "_" for c in name)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Disposition",
+                         f"attachment; filename=\"{plain}\"; filename*=UTF-8''{quote(name)}")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+        sent = 0
+        last_percent = -1
+        try:
+            with source:
+                while sent < size:
+                    chunk = source.read(min(BUFFER_SIZE, size - sent))   # 64 KB at a time
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    sent += len(chunk)
+                    percent = sent * 100 // size
+                    if percent != last_percent:
+                        last_percent = percent
+                        state.set_status(f"Sending {name} – {percent}%")
+            if sent == size:
+                state.set_status(f"Sent {name} ✓")
+            else:
+                self.close_connection = True
+        except Exception:
+            # The iPad cancelled the download or the Wi-Fi dropped.
+            self.close_connection = True
+            state.set_status(f"Sending {name} stopped")
 
     def do_POST(self):
         url = urlsplit(self.path)
@@ -616,7 +762,7 @@ def run_window(control):
     root = tk.Tk()
     root.title("Laptop File Drop")
     root.configure(bg=BG, padx=28, pady=22)
-    root.minsize(760, 560)
+    root.minsize(820, 680)
 
     def label(text="", size=12, color=FG, bold=False, **kw):
         font = ("Segoe UI", size, "bold" if bold else "normal")
@@ -679,6 +825,25 @@ def run_window(control):
     pin_button = button(row, "", toggle_pin)
     pin_button.pack(side="left", padx=8)
 
+    # ---- Laptop -> iPad ----
+    label("Send to iPad / iPhone (they appear as download buttons on the web page):", 11, DIM)
+    send_row = tk.Frame(root, bg=BG)
+    send_row.pack(fill="x", pady=8)
+
+    def send_files():
+        chosen = filedialog.askopenfilenames(title="Choose files to send to the iPad / iPhone")
+        if chosen:
+            state.share(chosen)
+            refresh()
+
+    def clear_send_list():
+        state.clear_shared()
+        refresh()
+
+    button(send_row, "Send files to iPad / iPhone…", send_files).pack(side="left")
+    button(send_row, "Clear send list", clear_send_list).pack(side="left", padx=8)
+    shared_label = label("", 11, wraplength=760)
+
     label("Status:", 11, DIM)
     status_label = label("", 14, ACCENT, wraplength=700)
     label("Last files received:", 11, DIM)
@@ -726,6 +891,12 @@ def run_window(control):
         server_button.config(text="Stop server" if control.running else "Start server")
         folder_label.config(text=state.folder)
         status_label.config(text=state.status)
+        sharing = state.shared_list()
+        if sharing:
+            names = ", ".join(e["name"] for e in sharing[:6]) + (" …" if len(sharing) > 6 else "")
+            shared_label.config(text=f"Sharing {len(sharing)} file(s): {names}")
+        else:
+            shared_label.config(text="Not sharing any files")
         recent_label.config(text="\n".join(state.recent[:6]) or "Nothing yet")
 
     def tick():
