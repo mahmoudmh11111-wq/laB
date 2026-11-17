@@ -1,0 +1,26 @@
+name: Build EXE
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build tools
+        run: pip install pyinstaller qrcode
+      - name: Build the EXE
+        run: pyinstaller --onefile --windowed --name LaptopFileDrop laptop_file_drop.py
+      - name: Publish the EXE
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest dist/LaptopFileDrop.exe --title "Latest build" --notes "Built automatically"
